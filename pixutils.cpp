@@ -17,6 +17,13 @@ using namespace std;
 
 namespace fs = std::filesystem;
 
+// compresses all data into a single chunk
+#define COMPRESS_ALL
+
+// when not compressing into a single chunk,
+// only chunk files up to this max. size.
+#define MAX_CHUNK_SIZE 1048576
+
 class Pix {
 public:
 
@@ -26,7 +33,6 @@ public:
 
         vector<unsigned char> data;
     };    
-
     vector<Entry> entries;
 
     struct FileEntry {
@@ -35,16 +41,19 @@ public:
     };
     vector<FileEntry> fileEntries;
 
-    void create(std::string levelName, std::filesystem::path path)
-    {
 
+    Pix()
+    {
+        entries.clear();
+    }
+
+    // @TODO: Needs fixing, always off when compared to originals
+    void write(std::string levelName, std::filesystem::path path)
+    {
         fs::path rtdDir = path;
         rtdDir.append("rtd/");
 
-        fs::path levelFile = rtdDir;
-        levelFile.append(levelName + ".drl");
-
-        if (!fs::exists(rtdDir) || !fs::exists(levelFile))
+        if (!fs::exists(rtdDir))
         {
             printf("rtd dir does not exist\n");
             return;
@@ -55,10 +64,9 @@ public:
 
             // collect all entries
             size_t headerSize = 0;
-
-            for (auto& p : filesystem::recursive_directory_iterator(path)) 
+            for (auto& p : filesystem::recursive_directory_iterator(path))
             {
-                if (!p.is_regular_file() || p == levelFile)
+                if (!p.is_regular_file())
                     continue;
 
                 ifstream ifs(p.path(), ios::binary);
@@ -72,7 +80,6 @@ public:
                     ifs.seekg(0, ios::beg);
 
                     FileEntry entry;
-                    
                     entry.path = RelPath;
                     entry.data.resize(eof);
                     ifs.read(entry.data.data(), eof);
@@ -87,99 +94,92 @@ public:
                 }
             }
 
+            // make sure we account for this.
             totalContentSize += headerSize;
 
-            char* mainContentChunkBuffer = new char[totalContentSize];
-            if (!mainContentChunkBuffer)
-                return;
-
-            memset(mainContentChunkBuffer, 0, totalContentSize);
             auto bytesWritten = 0;
-            for (const auto& e : fileEntries)
-            {
-                const int sz = e.data.size();
-                size_t str_len = strlen(e.path.string().c_str());
-
-                memcpy((mainContentChunkBuffer + bytesWritten), (void*)&sz, 4);
-                memcpy((mainContentChunkBuffer + bytesWritten + 0x4), (void*)e.path.c_str(), str_len);
-                memset((mainContentChunkBuffer + bytesWritten + 0x4 + str_len), 0, 1);
-                memcpy((mainContentChunkBuffer + bytesWritten + 0x4 + str_len + 1), e.data.data(), sz);
-
-                bytesWritten += 4 + (str_len + 1) + (int)sz;
-            }
-
-            // compress the whole block
-            vector<char> mainContentChunk;
-
-            auto mainContentChunkSize = compressBound(bytesWritten);
-            mainContentChunk.resize(mainContentChunkSize);
-            compress2((Bytef*)mainContentChunk.data(), &mainContentChunkSize, (Bytef*)mainContentChunkBuffer, bytesWritten, Z_BEST_COMPRESSION);
-
-
-            // do the same, but just for the level file and make sure we process that at the end.
-            FileEntry LevelFileEntry;
-
-            std::ifstream levelIfs(levelFile, std::ios::binary);
-            if (!levelIfs.good())
-                return;
-
-            LevelFileEntry.path = levelFile;
-            levelIfs.seekg(0, ios::end);
-            LevelFileEntry.data.resize(levelIfs.tellg());
-            levelIfs.seekg(0, ios::beg);
-
-            levelIfs.read(LevelFileEntry.data.data(), LevelFileEntry.data.size());
-            levelIfs.close();
-
-            size_t levelChunkRawSize = 4 + LevelFileEntry.path.string().size() + LevelFileEntry.data.size();
-            char* levelEntry = new char[levelChunkRawSize];
-            if (!levelEntry)
-                return;
-
-            int nIdx = 1;
-            memcpy(levelEntry, &nIdx, 4);
-            std::string RelPath = fs::relative(LevelFileEntry.path, path).string();
-            auto str_len = strlen(RelPath.c_str());
-            memcpy(levelEntry + 0x4, (void*)RelPath.c_str(), str_len);
-            memset(levelEntry + 0x4 + str_len, 0, 1);
-            memcpy(levelEntry + 0x4 + str_len + 1, LevelFileEntry.data.data(), LevelFileEntry.data.size());
-
-
-            // compress the whole block
-            auto levelChunkCompressedSize = compressBound(levelChunkRawSize);
-
-            vector<char> levelChunk;
-            levelChunk.resize(levelChunkCompressedSize);
-            compress2((Bytef*)levelChunk.data(), &levelChunkCompressedSize, (Bytef*)mainContentChunkBuffer, levelChunkRawSize, Z_BEST_COMPRESSION);
-
             std::ofstream output("H:\\test.out.bin", ios::binary);
+
             if (output.good())
             {
-                // write out main content
-                output.write((char*)&totalContentSize, 4);
-                output.write((char*)&mainContentChunkSize, 4);
-                for (size_t i = 0; i < 0x7F8; ++i)
-                    output.put(0);
-                output.write(mainContentChunk.data(), mainContentChunkSize);
+                auto next2KBoundary = [](unsigned int offset) -> unsigned int {
+                    return (offset + 2047) / 2048 * 2048;
+                };
 
-                // then the level chunk with just the .drl
-                output.write((char*)&levelChunkRawSize, 4);
-                output.write((char*)&levelChunkCompressedSize, 4);
-                
-                size_t s = (((int)output.tellp()) + 2048 - 1) & ~(2048 - 1);
-                printf("%x\n", (int)s);
-                while (output.tellp() != s)
-                    output.put(0);
+                size_t numEntries = fileEntries.size();
+                while (numEntries)
+                {
+                    vector<FileEntry> entries;
+                    size_t tmpSize = 4;                 // minimum 4 bytes, since we need to store the number of entries.
+                    bytesWritten = 4;
 
+                    size_t processedEntries = 0;
 
-                output.write(levelChunk.data(), levelChunkCompressedSize);
+                    // collect upto 1024KB worth of data per chunk.
+                    for (auto& e : fileEntries)
+                    {
+                        size_t new_size = e.data.size() + strlen(e.path.string().c_str()) + 1 + 4;
+#ifndef COMPRESS_ALL
+                        if (tmpSize + new_size > MAX_CHUNK_SIZE)
+                            break;
+#endif
+                        tmpSize += new_size;                        
+                        entries.push_back(e);
+                        processedEntries++;
+                    }
+#ifndef COMPRESS_ALL
+                    fileEntries.erase(fileEntries.begin(), fileEntries.begin() + processedEntries);
+#endif
+
+                    // construct the chunk
+                    char* mainContentChunkBuffer = new char[tmpSize];
+                    if (!mainContentChunkBuffer)
+                        return;
+                    memset(mainContentChunkBuffer, 0, tmpSize);
+                    memcpy(mainContentChunkBuffer, &processedEntries, 4);
+
+                    for (auto& e : entries)
+                    {
+                        const int sz = e.data.size();
+                        size_t str_len = strlen(e.path.string().c_str());
+
+                        memcpy((mainContentChunkBuffer + bytesWritten), (void*)&sz, 4);
+                        memcpy((mainContentChunkBuffer + bytesWritten + 0x4), (void*)e.path.string().c_str(), str_len);
+                        memcpy((mainContentChunkBuffer + bytesWritten + 0x4 + str_len + 1), e.data.data(), sz);
+
+                        bytesWritten += 4 + (str_len + 1) + sz;
+                    }
+
+                    // compress the chunk
+                    vector<char> mainContentChunk;
+                    auto mainContentChunkSize = compressBound(bytesWritten);
+                    mainContentChunk.resize(mainContentChunkSize);
+                    if (compress2((Bytef*)mainContentChunk.data(), &mainContentChunkSize, (Bytef*)mainContentChunkBuffer, bytesWritten, Z_BEST_COMPRESSION) != Z_OK)
+                    {
+                        printf("Error: Couldn't compress data\n");
+                        return;
+                    }
+
+                    // construct the actual chunk, in the proper format
+                    output.write((char*)&mainContentChunkSize, 4);
+                    output.write((char*)&bytesWritten, 4);
+
+                    int aligned_end = next2KBoundary(output.tellp());
+                    while (output.tellp() != aligned_end)
+                        output.put(0);
+                    output.write(mainContentChunk.data(), mainContentChunkSize);
+
+                    // keep track
+                    numEntries -= processedEntries;
+                }
 
                 // add the last entry to make the end align to the nearest 0x100
                 int lastCompressedBlockSize = 0;
                 int lastDecompressedBlockSize = 0;
                 output.write((char*)&lastCompressedBlockSize, 4);
                 output.write((char*)&lastDecompressedBlockSize, 4);
-                while (!((int)output.tellp() & 0x100))
+                size_t aligned_end = next2KBoundary((int)output.tellp());
+                while (output.tellp() != aligned_end)
                     output.put(0);
 
                 output.close();
@@ -187,17 +187,7 @@ public:
         }
     }
 
-
-    Pix(std::string levelName, std::filesystem::path path)
-    {
-        entries.clear();
-    }
-    void write(std::filesystem::path path)
-    {
-
-    }
-
-
+    // read
     Pix(std::ifstream& ifs)
     {
         while (!ifs.eof())
@@ -238,7 +228,6 @@ public:
             uncompressed.resize(entry.decompressed_size);
 
             printf("Processing %s\n", name.c_str());
-            Z_MEM_ERROR;
             uLong unc = entry.data.size();
             int ret = uncompress2((Bytef*)uncompressed.data(), &ucompSize, (Bytef*)entry.data.data(), &unc);
             if (ret == Z_OK) 
@@ -324,6 +313,69 @@ int main(int argc, char** argp)
         }
         return 0;
     }
+    else if (std::string(argp[1]) == "-nc" || std::string(argp[1]) == "nc")
+    {
+        if (argc < 4) {
+            printf("Usage: pixutils.exe -nc <directory> <output file>\n");
+            return -1;
+        }
+
+        if (!fs::exists(argp[2])) {
+            printf("Error: Input directory does not exist.\n");
+            return -1;
+        }
+
+        vector<Pix::FileEntry> fileEntries;
+        for (auto& p : filesystem::recursive_directory_iterator(argp[2])) {
+            if (!p.is_regular_file())
+                continue;
+
+            ifstream ifs(p.path(), ios::binary);
+            if (ifs.good())
+            {
+                auto RelPath = fs::relative(p.path(), argp[2]).string();
+
+                printf("Adding '%s'...", RelPath.c_str());
+                ifs.seekg(0, ios::end);
+                size_t eof = ifs.tellg();
+                ifs.seekg(0, ios::beg);
+
+                Pix::FileEntry entry;
+                entry.path = RelPath;
+                entry.data.resize(eof);
+                ifs.read(entry.data.data(), eof);
+
+                printf("(size: 0x%X).\n", (int)entry.data.size());
+
+                fileEntries.push_back(entry);
+            }
+        }
+
+        int numEntries = fileEntries.size();
+        if (numEntries > 0)
+        {
+            std::ofstream output(argp[3], ios::binary);
+            if (output.good())
+            {
+                output.write((char*)&numEntries, 4);
+                for (auto& e : fileEntries)
+                {
+                    int sz = e.data.size();
+                    output.write((char*)&sz, 4);
+                    output.write(e.path.string().c_str(), strlen(e.path.string().c_str()));
+                    output.put(0);
+                    output.write(e.data.data(), e.data.size());
+                }
+                output.close();
+
+                printf("Written %d entries to %s\n", numEntries, argp[3]);
+            }
+            else
+                printf("Error: Couldn't open output file.\n");
+        }
+        else
+            printf("Error: No files found.\n");
+    }
     else if (std::string(argp[1]) == "-c" || std::string(argp[1]) == "c")
     {
         std::filesystem::path dir(argp[2]);
@@ -331,13 +383,12 @@ int main(int argc, char** argp)
             return -1;
 
         printf("Creating %s with dir '%ws'\n", std::string(argp[3]).c_str(), dir.c_str());
-        Pix file(argp[3], dir);
-        file.create(argp[3], dir);
+        Pix file;
 
         string outputFile = argp[3];
         outputFile.append(".PIX");
         printf("Writing to '%s'\n", outputFile.c_str());
-        file.write(outputFile);
+        file.write(argp[3], dir);
         return 1;
     }
     else
